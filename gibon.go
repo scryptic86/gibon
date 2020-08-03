@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/signal"
 	"path"
-	"regexp"
 	"strconv"
 	"syscall"
 
@@ -22,11 +21,6 @@ import (
 	files "github.com/ipfs/go-ipfs-files"
 	icore "github.com/ipfs/interface-go-ipfs-core"
 	icorepath "github.com/ipfs/interface-go-ipfs-core/path"
-)
-
-var (
-	// Valid paste filename check
-	validPasteRegex = regexp.MustCompile(`/([a-z]|[A-Z]|[0-9]|\.)*$`)
 )
 
 type pasteHandler struct {
@@ -56,12 +50,6 @@ func (h *pasteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Check for valid paste ID
 	rawPath := r.URL.EscapedPath()
 
-	// Check if we have a valid URL path
-	if !validPasteRegex.MatchString(rawPath) {
-		http.Error(w, "Illegal paste name!", http.StatusServiceUnavailable)
-		return
-	}
-
 	switch r.Method {
 	case "GET":
 		// At root send help string
@@ -82,7 +70,7 @@ func (h *pasteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "POST":
 		// If not at root, send error
 		if rawPath != "/" {
-			http.Error(w, "Please post new pastes to site root", http.StatusBadRequest)
+			http.Error(w, "Please POST new pastes to site root!", http.StatusBadRequest)
 			return
 		}
 
