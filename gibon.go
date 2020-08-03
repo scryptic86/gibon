@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/ipfs/go-ipfs/core"
@@ -22,6 +23,8 @@ import (
 	icore "github.com/ipfs/interface-go-ipfs-core"
 	icorepath "github.com/ipfs/interface-go-ipfs-core/path"
 )
+
+const pastePrefix = "/paste/"
 
 type pasteHandler struct {
 	ctx  context.Context
@@ -49,6 +52,7 @@ func (h *pasteHandler) putPaste(paste []byte) (string, error) {
 func (h *pasteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Check for valid paste ID
 	rawPath := r.URL.EscapedPath()
+	log.Printf("Serve: %s %s\n", r.Method, rawPath)
 
 	switch r.Method {
 	case "GET":
@@ -57,6 +61,14 @@ func (h *pasteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte("Gibon -- IPFS-backed pastebin service!\n"))
 			return
 		}
+
+		// Ensure has paste prefix then correct to IPFS path
+		if !strings.HasPrefix(rawPath, pastePrefix) {
+			log.Printf("Illegal paste path requested: %s\n", rawPath)
+			http.Error(w, "Illegal paste path!", http.StatusNotAcceptable)
+			return
+		}
+		rawPath = strings.Replace(rawPath, pastePrefix, "/ipld/", 1)
 
 		// Try look for paste with CID
 		b, err := h.getPaste(rawPath)
@@ -70,10 +82,15 @@ func (h *pasteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "POST":
 		// If not at root, send error
 		if rawPath != "/" {
+			log.Println("Paste POST request to non-root path")
 			http.Error(w, "Please POST new pastes to site root!", http.StatusBadRequest)
 			return
 		}
 
+		// Set max read size to 1MB
+		r.Body = http.MaxBytesReader(w, r.Body, 1048576)
+
+		// Read body until byte slice
 		body, err := ioutil.ReadAll(r.Body)
 		if err != nil {
 			log.Println(err.Error())
@@ -82,14 +99,17 @@ func (h *pasteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		defer r.Body.Close()
 
-		cidStr, err := h.putPaste(body)
+		// Place the byte slice in the IPFS store
+		pathStr, err := h.putPaste(body)
 		if err != nil {
 			log.Println(err.Error())
 			http.Error(w, "Failed to put paste at CID", http.StatusInternalServerError)
 			return
 		}
+		pathStr = strings.Replace(pathStr, "/ipld/", pastePrefix, 1)
 
-		w.Write([]byte(cidStr))
+		// Write the store path in response
+		w.Write([]byte(pathStr))
 	}
 }
 
@@ -99,24 +119,28 @@ func constructIPFSNodeAPI(ctx context.Context, repoPath string) (icore.CoreAPI, 
 	if err != nil {
 		return nil, err
 	}
+	log.Println("Loaded external IPFS repo plugins")
 
 	// Load preloaded and external plugins
 	err = plugins.Initialize()
 	if err != nil {
 		return nil, err
 	}
+	log.Println("... initialized!")
 
 	// Inject the plugins
 	err = plugins.Inject()
 	if err != nil {
 		return nil, err
 	}
+	log.Println("... injected!")
 
 	// Open the repo
 	repo, err := fsrepo.Open(repoPath)
 	if err != nil {
 		return nil, err
 	}
+	log.Println("IPFS repo path opened")
 
 	// Construct the node
 	node, err := core.NewNode(
@@ -130,6 +154,7 @@ func constructIPFSNodeAPI(ctx context.Context, repoPath string) (icore.CoreAPI, 
 	if err != nil {
 		return nil, err
 	}
+	log.Println("IPFS node constructed!")
 
 	// Return core API wrapping the node
 	return coreapi.NewCoreAPI(node)
@@ -159,13 +184,20 @@ func main() {
 
 	// Start HTTP server
 	httpAddr := *httpBindAddr + ":" + strconv.Itoa(int(*httpPort))
-	err = http.ListenAndServe(httpAddr /**cert, *key,*/, handler)
-	if err != nil {
-		log.Fatalf(err.Error())
-	}
+	go func() {
+		err = http.ListenAndServe(httpAddr /**cert, *key,*/, handler)
+		if err != nil {
+			log.Fatalf(err.Error())
+		}
+	}()
+	log.Println("HTTP server started!")
 
+	// Setup channel for OS signals
 	signals := make(chan os.Signal)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL)
+	log.Println("Listening for OS signals...")
+
+	// Exit on signal
 	sig := <-signals
-	log.Fatalf("Signal received %s...\n", sig)
+	log.Fatalf("Signal received %s, stopping!\n", sig)
 }
