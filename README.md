@@ -1,3 +1,4 @@
-A work-in-progress pastebin application in GoLang based on IPFS.
+A work-in-progress HTTP-accessible pastebin service in GoLang,
+storage backed by IPFS.
 
-Very simple HTTP server and IPFS storage for now
+Very very simple for now.
