@@ -1,15 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -22,16 +26,17 @@ import (
 	"github.com/ipfs/go-ipfs/repo/fsrepo"
 
 	config "github.com/ipfs/go-ipfs-config"
-	files "github.com/ipfs/go-ipfs-files"
 	icore "github.com/ipfs/interface-go-ipfs-core"
 	icorepath "github.com/ipfs/interface-go-ipfs-core/path"
 )
 
 const (
 	pastePrefix = "/paste/"
-	ipfsPrefix  = "/ipfs/"
+	ipfsPrefix  = "/ipld/"
 
 	maxPasteSize = 1048576
+	maxTitleSize = 100
+	maxJSONSize  = maxPasteSize + maxTitleSize + 100
 
 	unixfsGetTimeout = time.Millisecond * 250
 
@@ -45,24 +50,51 @@ GET example.com/paste/<PASTE_ID>
 --> 'paste text goes here'
 
 e.g.
-$ curl example.com --data "$(cat somefile.txt)"
+$ curl example.com/filename.sh --data "$(cat somefile.txt)"
 /paste/Qmenmh8JwVoUGc4tCj3us9bx8YmADCHGEkcHjUUVsxByVN
 
 $ curl example.com/paste/Qmenmh8JwVoUGc4tCj3us9bx8YmADCHGEkcHjUUVsxByVN
 <output of somefile.txt>
+
+$ curl example.com/paste/Qmenmh8JwVoUGc4tCj3us9bx8YmADCHGEkcHjUUVsxByVN --header 'content-type: application/json'
+{"name":"filename.sh","text":"<output of somefile.txt>"}
 `
 )
 
 var (
 	globalContext context.Context
 	globalCancel  func()
+
+	validPasteName = regexp.MustCompile(`^([a-z]|[A-Z]|[0-9]|\.)*$`)
 )
+
+type Paste struct {
+	Name string `json:"name"`
+	Text string `json:"text"`
+}
+
+func newPaste(name string, raw []byte) *Paste {
+	return &Paste{
+		Name: name,
+		Text: string(raw),
+	}
+}
+
+func pasteFromJSON(b []byte) (*Paste, error) {
+	p := &Paste{}
+	err := json.Unmarshal(b, p)
+	return p, err
+}
+
+func (p *Paste) toJSON() []byte {
+	return []byte(`{"name":"` + p.Name + `","text":"` + p.Text + `"}`)
+}
 
 type pasteHandler struct {
 	ipfs icore.CoreAPI
 }
 
-func (h *pasteHandler) getPaste(pathStr string) (io.Reader, error) {
+func (h *pasteHandler) getPaste(pathStr string) (*Paste, error) {
 	// Create new IPFS path from input
 	ipfsPath := icorepath.New(pathStr)
 
@@ -70,41 +102,49 @@ func (h *pasteHandler) getPaste(pathStr string) (io.Reader, error) {
 	ctx, cancel := context.WithDeadline(globalContext, time.Now().Add(unixfsGetTimeout))
 	defer cancel()
 
-	// Attempt to retrieve node for path
-	node, err := h.ipfs.Unixfs().Get(ctx, ipfsPath)
+	// Get reader for object
+	reader, err := h.ipfs.Block().Get(ctx, ipfsPath)
 	if err != nil {
 		return nil, err
 	}
 
-	// Check if node is a file, if so then cast it!
-	file, ok := node.(files.File)
-	if !ok {
-		return nil, errors.New("IPFS node not file")
+	// Read from the supplied reader
+	b, err := ioutil.ReadAll(io.LimitReader(reader, maxJSONSize))
+	if err != nil {
+		return nil, err
 	}
 
-	// Read up to maxPasteSize of block contents
-	return io.LimitReader(file, maxPasteSize), nil
+	// Return the paste
+	return pasteFromJSON(b)
 }
 
-func (h *pasteHandler) putPaste(body io.ReadCloser) (string, error) {
-	// Wrap body in File object, defer close
-	file := files.NewReaderFile(body)
-	defer body.Close()
+func (h *pasteHandler) putPaste(p *Paste) (string, error) {
+	// Create new bytes reader based on Paste JSON
+	reader := bytes.NewReader(p.toJSON())
 
-	// Add new file object to the IPFS store via the Unixfs API
-	rPath, err := h.ipfs.Unixfs().Add(globalContext, file)
+	// Put Paste JSON in IPFS storage
+	stat, err := h.ipfs.Block().Put(globalContext, reader)
 	if err != nil {
 		return "", err
 	}
 
 	// Return the resolved path
-	return rPath.String(), nil
+	return stat.Path().String(), nil
 }
 
 func (h *pasteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Check for valid paste ID
+	// Get escaped path
 	rawPath := r.URL.EscapedPath()
-	log.Printf("Serve: %s %s\n", r.Method, rawPath)
+
+	// Ensure is absolute and within size bounds
+	if !path.IsAbs(rawPath) || len(rawPath) > maxTitleSize {
+		log.Printf("Illegal paste path requested: %s\n", rawPath)
+		http.Error(w, "Illegal paste path!", http.StatusNotAcceptable)
+		return
+	}
+
+	// Log request
+	log.Printf("(%s) %s %s\n", r.RemoteAddr, r.Method, rawPath)
 
 	switch r.Method {
 	case "GET":
@@ -123,7 +163,7 @@ func (h *pasteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rawPath = strings.Replace(rawPath, pastePrefix, ipfsPrefix, 1)
 
 		// Try look for paste with CID
-		reader, err := h.getPaste(rawPath)
+		p, err := h.getPaste(rawPath)
 		if err != nil {
 			log.Printf("Paste not retrieved - %s\n", err.Error())
 			http.Error(w, "Paste not found!", http.StatusNotFound)
@@ -131,25 +171,41 @@ func (h *pasteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Write the paste!
-		w.Header().Set("content-type", "text/plain")
-		io.Copy(w, reader)
+		if r.Header.Get("content-type") == "application/json" {
+			w.Header().Set("content-type", "application/json")
+			w.Write([]byte(p.toJSON()))
+		} else {
+			w.Header().Set("content-type", "text/plain")
+			w.Write([]byte(p.Text))
+		}
 
 	case "POST":
-		// If not at root, send error
-		if rawPath != "/" {
-			log.Println("Paste POST request to non-root path")
-			http.Error(w, "Please POST new pastes to site root!", http.StatusBadRequest)
+		// Get raw path without leading /
+		rawPath = strings.TrimPrefix(rawPath, "/")
+
+		// Check for valid paste name
+		if !validPasteName.MatchString(rawPath) {
+			log.Printf("Invalid paste name: %s\n", rawPath)
+			http.Error(w, "Invalid paste name!", http.StatusBadRequest)
 			return
 		}
 
 		// Set max read size to 1MB
 		r.Body = http.MaxBytesReader(w, r.Body, maxPasteSize)
 
-		// Place the byte slice in the IPFS store
-		pathStr, err := h.putPaste(r.Body)
+		// Read body content
+		b, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			log.Println("Failed to read request body")
+			http.Error(w, "Failed to read request", http.StatusInternalServerError)
+			return
+		}
+
+		// Place the paste into the IPFS store
+		pathStr, err := h.putPaste(newPaste(rawPath, b))
 		if err != nil {
 			log.Printf("Failed to put paste in store - %s\n", err.Error())
-			http.Error(w, "Failed to put paste at CID", http.StatusInternalServerError)
+			http.Error(w, "Failed to put paste in store", http.StatusInternalServerError)
 			return
 		}
 		pathStr = strings.Replace(pathStr, ipfsPrefix, pastePrefix, 1)

@@ -8,4 +8,5 @@ require (
 	github.com/ipfs/go-ipfs-config v0.8.0
 	github.com/ipfs/go-ipfs-files v0.0.8
 	github.com/ipfs/interface-go-ipfs-core v0.3.0
+	go.uber.org/ratelimit v0.1.0
 )
