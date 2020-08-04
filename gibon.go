@@ -292,7 +292,7 @@ func constructIPFSNodeAPI(repoPath string) (icore.CoreAPI, error) {
 	node, err := core.NewNode(
 		globalContext,
 		&core.BuildCfg{
-			Online:  true,
+			Online:  false,
 			Routing: libp2p.DHTOption,
 			Repo:    repo,
 		},
