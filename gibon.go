@@ -2,8 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -12,41 +13,87 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
+	files "github.com/ipfs/go-ipfs-files"
 	"github.com/ipfs/go-ipfs/core"
 	"github.com/ipfs/go-ipfs/core/coreapi"
 	"github.com/ipfs/go-ipfs/core/node/libp2p"
 	"github.com/ipfs/go-ipfs/plugin/loader"
 	"github.com/ipfs/go-ipfs/repo/fsrepo"
 
-	files "github.com/ipfs/go-ipfs-files"
 	icore "github.com/ipfs/interface-go-ipfs-core"
 	icorepath "github.com/ipfs/interface-go-ipfs-core/path"
 )
 
-const pastePrefix = "/paste/"
+const (
+	pastePrefix = "/paste/"
+	ipfsPrefix  = "/ipfs/"
+
+	maxPasteSize = 1048576
+
+	unixfsGetTimeout = time.Millisecond * 250
+
+	rootHelpStr = `Gibon -- an IPFS-backed pastebin service!
+
+Usage:
+POST example.com 'paste text goes here'
+--> '/paste/<PASTE_ID>'
+
+GET example.com/paste/<PASTE_ID>
+--> 'paste text goes here'
+
+e.g.
+$ curl example.com --data "$(cat somefile.txt)"
+/paste/Qmenmh8JwVoUGc4tCj3us9bx8YmADCHGEkcHjUUVsxByVN
+
+$ curl example.com/paste/Qmenmh8JwVoUGc4tCj3us9bx8YmADCHGEkcHjUUVsxByVN
+<output of somefile.txt>
+`
+)
 
 type pasteHandler struct {
 	ctx  context.Context
 	ipfs icore.CoreAPI
 }
 
-func (h *pasteHandler) getPaste(cidStr string) ([]byte, error) {
-	cidPath := icorepath.New(cidStr)
-	r, err := h.ipfs.Block().Get(h.ctx, cidPath)
+func (h *pasteHandler) getPaste(pathStr string) (io.Reader, error) {
+	// Create new IPFS path from input
+	ipfsPath := icorepath.New(pathStr)
+
+	// Get new deadline context (timeout on no paste found)
+	ctx, cancel := context.WithDeadline(h.ctx, time.Now().Add(unixfsGetTimeout))
+	defer cancel()
+
+	// Attempt to retrieve node for path
+	node, err := h.ipfs.Unixfs().Get(ctx, ipfsPath)
 	if err != nil {
 		return nil, err
 	}
-	return ioutil.ReadAll(r)
+
+	// Check if node is a file, if so then cast it!
+	file, ok := node.(files.File)
+	if !ok {
+		return nil, errors.New("IPFS node not file")
+	}
+
+	// Read up to maxPasteSize of block contents
+	return io.LimitReader(file, maxPasteSize), nil
 }
 
-func (h *pasteHandler) putPaste(paste []byte) (string, error) {
-	file := files.NewBytesFile(paste)
-	stat, err := h.ipfs.Block().Put(h.ctx, file)
+func (h *pasteHandler) putPaste(body io.ReadCloser) (string, error) {
+	// Wrap body in File object, defer close
+	file := files.NewReaderFile(body)
+	defer body.Close()
+
+	// Add new file object to the IPFS store via the Unixfs API
+	rPath, err := h.ipfs.Unixfs().Add(h.ctx, file)
 	if err != nil {
 		return "", err
 	}
-	return stat.Path().String(), nil
+
+	// Return the resolved path
+	return rPath.String(), nil
 }
 
 func (h *pasteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -58,7 +105,7 @@ func (h *pasteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "GET":
 		// At root send help string
 		if rawPath == "/" {
-			w.Write([]byte("Gibon -- IPFS-backed pastebin service!\n"))
+			w.Write([]byte(rootHelpStr))
 			return
 		}
 
@@ -68,16 +115,19 @@ func (h *pasteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Illegal paste path!", http.StatusNotAcceptable)
 			return
 		}
-		rawPath = strings.Replace(rawPath, pastePrefix, "/ipld/", 1)
+		rawPath = strings.Replace(rawPath, pastePrefix, ipfsPrefix, 1)
 
 		// Try look for paste with CID
-		b, err := h.getPaste(rawPath)
+		reader, err := h.getPaste(rawPath)
 		if err != nil {
-			log.Println(err.Error())
+			log.Printf("Paste not retrieved - %s\n", err.Error())
 			http.Error(w, "Paste not found!", http.StatusNotFound)
 			return
 		}
-		w.Write(b)
+
+		// Write the paste!
+		w.Header().Set("content-type", "text/plain")
+		io.Copy(w, reader)
 
 	case "POST":
 		// If not at root, send error
@@ -88,27 +138,19 @@ func (h *pasteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Set max read size to 1MB
-		r.Body = http.MaxBytesReader(w, r.Body, 1048576)
-
-		// Read body until byte slice
-		body, err := ioutil.ReadAll(r.Body)
-		if err != nil {
-			log.Println(err.Error())
-			http.Error(w, "Failed reading request body", http.StatusServiceUnavailable)
-			return
-		}
-		defer r.Body.Close()
+		r.Body = http.MaxBytesReader(w, r.Body, maxPasteSize)
 
 		// Place the byte slice in the IPFS store
-		pathStr, err := h.putPaste(body)
+		pathStr, err := h.putPaste(r.Body)
 		if err != nil {
-			log.Println(err.Error())
+			log.Printf("Failed to put paste in store - %s\n", err.Error())
 			http.Error(w, "Failed to put paste at CID", http.StatusInternalServerError)
 			return
 		}
-		pathStr = strings.Replace(pathStr, "/ipld/", pastePrefix, 1)
+		pathStr = strings.Replace(pathStr, ipfsPrefix, pastePrefix, 1)
 
 		// Write the store path in response
+		w.Header().Set("content-type", "text/plain")
 		w.Write([]byte(pathStr))
 	}
 }
@@ -164,7 +206,21 @@ func main() {
 	httpBindAddr := flag.String("http-bind-addr", "localhost", "Bind HTTP server to address")
 	httpPort := flag.Uint("http-port", 443, "Bind HTTP server to port")
 	ipfsRepo := flag.String("ipfs-repo", "/var/ipfs", "IPFS repo path")
+	certFile := flag.String("cert-file", "", "TLS certificate file")
+	keyFile := flag.String("key-file", "", "TLS key file")
 	flag.Parse()
+
+	// Check we have been supplied IPFS repo
+	if *ipfsRepo == "" {
+		log.Fatalf("No IPFS repo path supplied!")
+	}
+
+	// Check we have been supplied necessary TLS cert + Key files
+	if *certFile == "" {
+		log.Fatalf("No TLS certificate file supplied!")
+	} else if *keyFile == "" {
+		log.Fatalf("No TLS key file supplied!")
+	}
 
 	// Get current context (cancellable)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -176,16 +232,20 @@ func main() {
 		log.Fatalf(err.Error())
 	}
 
-	// Create new pasteHandler instance to handle HTTP side
-	handler := &pasteHandler{
-		ctx,
-		coreAPI,
+	// Create new HTTP server object
+	httpAddr := *httpBindAddr + ":" + strconv.Itoa(int(*httpPort))
+	server := &http.Server{
+		Addr:              httpAddr,
+		ReadTimeout:       2 * time.Second,
+		WriteTimeout:      2 * time.Second,
+		IdleTimeout:       2 * time.Second,
+		ReadHeaderTimeout: 2 * time.Second,
+		Handler:           &pasteHandler{ctx, coreAPI},
 	}
 
-	// Start HTTP server
-	httpAddr := *httpBindAddr + ":" + strconv.Itoa(int(*httpPort))
+	// Start HTTP server!
 	go func() {
-		err = http.ListenAndServe(httpAddr /**cert, *key,*/, handler)
+		err = server.ListenAndServeTLS(*certFile, *keyFile)
 		if err != nil {
 			log.Fatalf(err.Error())
 		}
