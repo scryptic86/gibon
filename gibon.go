@@ -21,6 +21,7 @@ import (
 	"github.com/ipfs/go-ipfs/plugin/loader"
 	"github.com/ipfs/go-ipfs/repo/fsrepo"
 
+	config "github.com/ipfs/go-ipfs-config"
 	files "github.com/ipfs/go-ipfs-files"
 	icore "github.com/ipfs/interface-go-ipfs-core"
 	icorepath "github.com/ipfs/interface-go-ipfs-core/path"
@@ -52,8 +53,12 @@ $ curl example.com/paste/Qmenmh8JwVoUGc4tCj3us9bx8YmADCHGEkcHjUUVsxByVN
 `
 )
 
+var (
+	globalContext context.Context
+	globalCancel  func()
+)
+
 type pasteHandler struct {
-	ctx  context.Context
 	ipfs icore.CoreAPI
 }
 
@@ -62,7 +67,7 @@ func (h *pasteHandler) getPaste(pathStr string) (io.Reader, error) {
 	ipfsPath := icorepath.New(pathStr)
 
 	// Get new deadline context (timeout on no paste found)
-	ctx, cancel := context.WithDeadline(h.ctx, time.Now().Add(unixfsGetTimeout))
+	ctx, cancel := context.WithDeadline(globalContext, time.Now().Add(unixfsGetTimeout))
 	defer cancel()
 
 	// Attempt to retrieve node for path
@@ -87,7 +92,7 @@ func (h *pasteHandler) putPaste(body io.ReadCloser) (string, error) {
 	defer body.Close()
 
 	// Add new file object to the IPFS store via the Unixfs API
-	rPath, err := h.ipfs.Unixfs().Add(h.ctx, file)
+	rPath, err := h.ipfs.Unixfs().Add(globalContext, file)
 	if err != nil {
 		return "", err
 	}
@@ -155,38 +160,81 @@ func (h *pasteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func constructIPFSNodeAPI(ctx context.Context, repoPath string) (icore.CoreAPI, error) {
+func initIPFSRepo(repoPath string) error {
+	// Check repo path actually exists (and accessible)
+	_, err := os.Stat(repoPath)
+	if err != nil {
+		return err
+	}
+
+	// Directory exists, check we can write
+	testPath := path.Join(repoPath, "test")
+	fd, err := os.Create(testPath)
+	if err != nil {
+		if os.IsPermission(err) {
+			return errors.New("Repo path is not writable")
+		}
+		return err
+	}
+
+	// Close and delete test file
+	fd.Close()
+	os.Remove(testPath)
+
+	// Init new repo config
+	log.Println("Generating new IPFS config...")
+	cfg, err := config.Init(log.Writer(), 4096)
+	if err != nil {
+		return err
+	}
+
+	// Init new repo on repo path
+	log.Println("Initializing new IPFS repo...")
+	err = fsrepo.Init(repoPath, cfg)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func setupIPFSPlugins(repoPath string) error {
 	// Load any external plugins
+	log.Println("Loading external IPFS repo plugins")
 	plugins, err := loader.NewPluginLoader(path.Join(repoPath, "plugins"))
 	if err != nil {
-		return nil, err
+		return err
 	}
-	log.Println("Loaded external IPFS repo plugins")
 
 	// Load preloaded and external plugins
+	log.Println("... initializing...")
 	err = plugins.Initialize()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	log.Println("... initialized!")
 
 	// Inject the plugins
+	log.Println("... injecting...")
 	err = plugins.Inject()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	log.Println("... injected!")
 
+	return nil
+}
+
+func constructIPFSNodeAPI(repoPath string) (icore.CoreAPI, error) {
 	// Open the repo
+	log.Println("Opening IPFS repo path...")
 	repo, err := fsrepo.Open(repoPath)
 	if err != nil {
 		return nil, err
 	}
-	log.Println("IPFS repo path opened")
 
 	// Construct the node
+	log.Println("Constructing IPFS node object...")
 	node, err := core.NewNode(
-		ctx,
+		globalContext,
 		&core.BuildCfg{
 			Online:  true,
 			Routing: libp2p.DHTOption,
@@ -196,40 +244,72 @@ func constructIPFSNodeAPI(ctx context.Context, repoPath string) (icore.CoreAPI, 
 	if err != nil {
 		return nil, err
 	}
-	log.Println("IPFS node constructed!")
 
 	// Return core API wrapping the node
+	log.Println("Wrapping IPFS node in core API...")
 	return coreapi.NewCoreAPI(node)
+}
+
+func fatalf(fmt string, args ...interface{}) {
+	// Cancel global context if non-nil
+	if globalCancel != nil {
+		globalCancel()
+	}
+
+	// Finally, log fatal
+	log.Fatalf(fmt, args...)
 }
 
 func main() {
 	httpBindAddr := flag.String("http-bind-addr", "localhost", "Bind HTTP server to address")
 	httpPort := flag.Uint("http-port", 443, "Bind HTTP server to port")
-	ipfsRepo := flag.String("ipfs-repo", "/var/ipfs", "IPFS repo path")
+	ipfsRepo := flag.String("ipfs-repo", "", "IPFS repo path")
 	certFile := flag.String("cert-file", "", "TLS certificate file")
 	keyFile := flag.String("key-file", "", "TLS key file")
 	flag.Parse()
 
+	// Get current context (cancellable)
+	globalContext, globalCancel = context.WithCancel(context.Background())
+
 	// Check we have been supplied IPFS repo
 	if *ipfsRepo == "" {
-		log.Fatalf("No IPFS repo path supplied!")
+		fatalf("No IPFS repo path supplied!")
 	}
 
 	// Check we have been supplied necessary TLS cert + Key files
 	if *certFile == "" {
-		log.Fatalf("No TLS certificate file supplied!")
+		fatalf("No TLS certificate file supplied!")
 	} else if *keyFile == "" {
-		log.Fatalf("No TLS key file supplied!")
+		fatalf("No TLS key file supplied!")
 	}
 
-	// Get current context (cancellable)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// Check if repo initialized
+	if !fsrepo.IsInitialized(*ipfsRepo) {
+		log.Printf("IPFS repo at %s does not exist!\n", *ipfsRepo)
+
+		// First load plugins
+		err := setupIPFSPlugins("")
+		if err != nil {
+			fatalf(err.Error())
+		}
+
+		// Try initialize repo
+		err = initIPFSRepo(*ipfsRepo)
+		if err != nil {
+			fatalf(err.Error())
+		}
+	} else {
+		// First load plugins
+		err := setupIPFSPlugins(*ipfsRepo)
+		if err != nil {
+			fatalf(err.Error())
+		}
+	}
 
 	// Get new IPFS node API instance
-	coreAPI, err := constructIPFSNodeAPI(ctx, *ipfsRepo)
+	coreAPI, err := constructIPFSNodeAPI(*ipfsRepo)
 	if err != nil {
-		log.Fatalf(err.Error())
+		fatalf(err.Error())
 	}
 
 	// Create new HTTP server object
@@ -240,24 +320,24 @@ func main() {
 		WriteTimeout:      2 * time.Second,
 		IdleTimeout:       2 * time.Second,
 		ReadHeaderTimeout: 2 * time.Second,
-		Handler:           &pasteHandler{ctx, coreAPI},
+		Handler:           &pasteHandler{coreAPI},
 	}
 
 	// Start HTTP server!
+	log.Printf("Starting HTTP server on: %s\n", httpAddr)
 	go func() {
 		err = server.ListenAndServeTLS(*certFile, *keyFile)
 		if err != nil {
-			log.Fatalf(err.Error())
+			fatalf(err.Error())
 		}
 	}()
-	log.Println("HTTP server started!")
 
 	// Setup channel for OS signals
+	log.Println("Listening for OS signals...")
 	signals := make(chan os.Signal)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGKILL)
-	log.Println("Listening for OS signals...")
 
 	// Exit on signal
 	sig := <-signals
-	log.Fatalf("Signal received %s, stopping!\n", sig)
+	fatalf("Signal received %s, stopping!\n", sig)
 }
