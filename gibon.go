@@ -3,9 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
@@ -13,7 +17,6 @@ import (
 	"os"
 	"os/signal"
 	"path"
-	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -35,66 +38,111 @@ const (
 	ipfsPrefix  = "/ipld/"
 
 	maxPasteSize = 1048576
-	maxTitleSize = 100
-	maxJSONSize  = maxPasteSize + maxTitleSize + 100
 
 	unixfsGetTimeout = time.Millisecond * 250
-
-	rootHelpStr = `Gibon -- an IPFS-backed pastebin service!
-
-Usage:
-POST example.com 'paste text goes here'
---> '/paste/<PASTE_ID>'
-
-GET example.com/paste/<PASTE_ID>
---> 'paste text goes here'
-
-e.g.
-$ curl example.com/filename.sh --data "$(cat somefile.txt)"
-/paste/Qmenmh8JwVoUGc4tCj3us9bx8YmADCHGEkcHjUUVsxByVN
-
-$ curl example.com/paste/Qmenmh8JwVoUGc4tCj3us9bx8YmADCHGEkcHjUUVsxByVN
-<output of somefile.txt>
-
-$ curl example.com/paste/Qmenmh8JwVoUGc4tCj3us9bx8YmADCHGEkcHjUUVsxByVN --header 'content-type: application/json'
-{"name":"filename.sh","text":"<output of somefile.txt>"}
-`
 )
 
 var (
+	rootHelpStr = `Gibon -- an IPFS-backed pastebin service with encryption support!
+
+Usage:
+$ curl https://%s --data 'paste text goes here'
+--> '/paste/<PASTE_ID>'
+
+$ curl https://%s/paste/<PASTE_ID>
+--> 'paste text goes here'
+
+$ curl https://%s/?key=awful_password --data 'paste text goes here'
+--> '/paste/<PASTE_ID>'
+
+$ curl https://%s/paste/<PASTE_ID>?key=awful_password
+--> 'paste text goes here'
+`
+
 	globalContext context.Context
 	globalCancel  func()
-
-	validPasteName = regexp.MustCompile(`^([a-z]|[A-Z]|[0-9]|\.)*$`)
 )
 
-type Paste struct {
-	Name string `json:"name"`
-	Text string `json:"text"`
+type paste struct {
+	text []byte
 }
 
-func newPaste(name string, raw []byte) *Paste {
-	return &Paste{
-		Name: name,
-		Text: string(raw),
+func (p *paste) encrypt(key string) error {
+	// Get new GCM wrapped AES block cipher for key
+	gcmBlockCipher, err := newAESGCMBlockCiperForKey(key)
+	if err != nil {
+		return err
 	}
+
+	// Create nonce of requested length
+	nonce := make([]byte, gcmBlockCipher.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return err
+	}
+
+	// Create cipher text
+	cipherText := gcmBlockCipher.Seal(
+		nil,
+		nonce,
+		p.text,
+		nil,
+	)
+
+	// Set paste text as nonce+cipherText
+	p.text = append(nonce, cipherText...)
+
+	// Return all good :)
+	return nil
 }
 
-func pasteFromJSON(b []byte) (*Paste, error) {
-	p := &Paste{}
-	err := json.Unmarshal(b, p)
-	return p, err
+func (p *paste) decrypt(key string) error {
+	// Get new GCM wrapped AES block cipher for key
+	gcmBlockCipher, err := newAESGCMBlockCiperForKey(key)
+	if err != nil {
+		return err
+	}
+
+	// Ensure paste long enough for nonce
+	if gcmBlockCipher.NonceSize() > len(p.text) {
+		return errors.New("text not long enough to contain nonce")
+	}
+
+	// Try decrypt using nonce and cipherText from raw paste text
+	text, err := gcmBlockCipher.Open(
+		nil,
+		p.text[:gcmBlockCipher.NonceSize()],
+		p.text[gcmBlockCipher.NonceSize():],
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+
+	// Set new decrypted text, set not-encrypted
+	p.text = text
+
+	return nil
 }
 
-func (p *Paste) toJSON() []byte {
-	return []byte(`{"name":"` + p.Name + `","text":"` + p.Text + `"}`)
+func newAESGCMBlockCiperForKey(key string) (cipher.AEAD, error) {
+	// Hash the supplied key
+	hash := sha256.Sum256([]byte(key))
+
+	// Create new AES block cipher based on key
+	blockCipher, err := aes.NewCipher(hash[:])
+	if err != nil {
+		return nil, err
+	}
+
+	// Return block cipher wrapped in GCM
+	return cipher.NewGCM(blockCipher)
 }
 
 type pasteHandler struct {
 	ipfs icore.CoreAPI
 }
 
-func (h *pasteHandler) getPaste(pathStr string) (*Paste, error) {
+func (h *pasteHandler) getPaste(pathStr string) (*paste, error) {
 	// Create new IPFS path from input
 	ipfsPath := icorepath.New(pathStr)
 
@@ -109,18 +157,18 @@ func (h *pasteHandler) getPaste(pathStr string) (*Paste, error) {
 	}
 
 	// Read from the supplied reader
-	b, err := ioutil.ReadAll(io.LimitReader(reader, maxJSONSize))
+	b, err := ioutil.ReadAll(io.LimitReader(reader, maxPasteSize))
 	if err != nil {
 		return nil, err
 	}
 
 	// Return the paste
-	return pasteFromJSON(b)
+	return &paste{b}, nil
 }
 
-func (h *pasteHandler) putPaste(p *Paste) (string, error) {
+func (h *pasteHandler) putPaste(p *paste) (string, error) {
 	// Create new bytes reader based on Paste JSON
-	reader := bytes.NewReader(p.toJSON())
+	reader := bytes.NewReader(p.text)
 
 	// Put Paste JSON in IPFS storage
 	stat, err := h.ipfs.Block().Put(globalContext, reader)
@@ -137,7 +185,7 @@ func (h *pasteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rawPath := r.URL.EscapedPath()
 
 	// Ensure is absolute and within size bounds
-	if !path.IsAbs(rawPath) || len(rawPath) > maxTitleSize {
+	if !path.IsAbs(rawPath) {
 		log.Printf("Illegal paste path requested: %s\n", rawPath)
 		http.Error(w, "Illegal paste path!", http.StatusNotAcceptable)
 		return
@@ -170,23 +218,24 @@ func (h *pasteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Write the paste!
-		if r.Header.Get("content-type") == "application/json" {
-			w.Header().Set("content-type", "application/json")
-			w.Write([]byte(p.toJSON()))
-		} else {
-			w.Header().Set("content-type", "text/plain")
-			w.Write([]byte(p.Text))
+		// If decryption key supplied, try decrypt
+		if key := r.URL.Query().Get("key"); key != "" {
+			err = p.decrypt(key)
+			if err != nil {
+				log.Printf("Failed to decrypt paste - %s\n", err.Error())
+				http.Error(w, "Paste decryption failed!", http.StatusInternalServerError)
+				return
+			}
 		}
 
-	case "POST":
-		// Get raw path without leading /
-		rawPath = strings.TrimPrefix(rawPath, "/")
+		// Write the paste!
+		w.Header().Set("content-type", "text/plain")
+		w.Write(p.text)
 
-		// Check for valid paste name
-		if !validPasteName.MatchString(rawPath) {
-			log.Printf("Invalid paste name: %s\n", rawPath)
-			http.Error(w, "Invalid paste name!", http.StatusBadRequest)
+	case "POST":
+		if rawPath != "/" {
+			log.Printf("Attempt to POST paste to non-root URL: %s\n", rawPath)
+			http.Error(w, "Pastes must be POSTed to root URL path!", http.StatusBadRequest)
 			return
 		}
 
@@ -201,8 +250,19 @@ func (h *pasteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Create new paste, if encryption key provided, try encrypt!
+		p := &paste{b}
+		if key := r.URL.Query().Get("key"); key != "" {
+			err = p.encrypt(key)
+			if err != nil {
+				log.Printf("Failed to encrypt paste - %s\n", err.Error())
+				http.Error(w, "Paste encryption failed!", http.StatusInternalServerError)
+				return
+			}
+		}
+
 		// Place the paste into the IPFS store
-		pathStr, err := h.putPaste(newPaste(rawPath, b))
+		pathStr, err := h.putPaste(p)
 		if err != nil {
 			log.Printf("Failed to put paste in store - %s\n", err.Error())
 			http.Error(w, "Failed to put paste in store", http.StatusInternalServerError)
@@ -316,7 +376,17 @@ func fatalf(fmt string, args ...interface{}) {
 	log.Fatalf(fmt, args...)
 }
 
+func init() {
+	// As part of init perform initial entropy assertion
+	b := make([]byte, 1)
+	_, err := io.ReadFull(rand.Reader, b)
+	if err != nil {
+		fatalf("Failed to assert safe source of system entropy exists!")
+	}
+}
+
 func main() {
+	httpHostname := flag.String("http-hostname", "", "Set HTTP hostname for printed help message")
 	httpBindAddr := flag.String("http-bind-addr", "localhost", "Bind HTTP server to address")
 	httpPort := flag.Uint("http-port", 443, "Bind HTTP server to port")
 	ipfsRepo := flag.String("ipfs-repo", "", "IPFS repo path")
@@ -378,6 +448,14 @@ func main() {
 		ReadHeaderTimeout: 2 * time.Second,
 		Handler:           &pasteHandler{coreAPI},
 	}
+
+	// If hostname not set, use httpAddr
+	if *httpHostname == "" {
+		*httpHostname = httpAddr
+	}
+
+	// Construct the HTTP root site help string
+	rootHelpStr = fmt.Sprintf(rootHelpStr, *httpHostname, *httpHostname, *httpHostname, *httpHostname)
 
 	// Start HTTP server!
 	log.Printf("Starting HTTP server on: %s\n", httpAddr)
