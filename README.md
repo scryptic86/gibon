@@ -1,7 +1,7 @@
 # Gibon
 
-A CURL-friendly pastebin service with AES+GCM encryption support,
-written in GoLang!
+A CURL-friendly pastebin service with AES+GCM encryption support, storage backed by
+IPFS, all written in GoLang!
 
 Service is TLS-only with HTTP routing handled by: github.com/julienschmidt/httprouter
 
