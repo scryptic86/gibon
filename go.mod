@@ -8,6 +8,7 @@ require (
 	github.com/ipfs/go-ipfs-config v0.8.0
 	github.com/ipfs/go-ipfs-files v0.0.8
 	github.com/ipfs/interface-go-ipfs-core v0.3.0
+	github.com/julienschmidt/httprouter v1.2.0
 	go.uber.org/ratelimit v0.1.0
 	golang.org/x/crypto v0.0.0-20200510223506-06a226fb4e37
 )

@@ -27,6 +27,7 @@ import (
 	"github.com/ipfs/go-ipfs/core/node/libp2p"
 	"github.com/ipfs/go-ipfs/plugin/loader"
 	"github.com/ipfs/go-ipfs/repo/fsrepo"
+	"github.com/julienschmidt/httprouter"
 
 	config "github.com/ipfs/go-ipfs-config"
 	icore "github.com/ipfs/interface-go-ipfs-core"
@@ -61,6 +62,8 @@ $ curl https://%s/paste/<PASTE_ID>?key=awful_password
 
 	globalContext context.Context
 	globalCancel  func()
+
+	ipfsAPI icore.CoreAPI
 )
 
 type paste struct {
@@ -142,7 +145,7 @@ type pasteHandler struct {
 	ipfs icore.CoreAPI
 }
 
-func (h *pasteHandler) getPaste(pathStr string) (*paste, error) {
+func getPaste(pathStr string) (*paste, error) {
 	// Create new IPFS path from input
 	ipfsPath := icorepath.New(pathStr)
 
@@ -151,7 +154,7 @@ func (h *pasteHandler) getPaste(pathStr string) (*paste, error) {
 	defer cancel()
 
 	// Get reader for object
-	reader, err := h.ipfs.Block().Get(ctx, ipfsPath)
+	reader, err := ipfsAPI.Block().Get(ctx, ipfsPath)
 	if err != nil {
 		return nil, err
 	}
@@ -166,12 +169,12 @@ func (h *pasteHandler) getPaste(pathStr string) (*paste, error) {
 	return &paste{b}, nil
 }
 
-func (h *pasteHandler) putPaste(p *paste) (string, error) {
+func putPaste(p *paste) (string, error) {
 	// Create new bytes reader based on Paste JSON
 	reader := bytes.NewReader(p.text)
 
 	// Put Paste JSON in IPFS storage
-	stat, err := h.ipfs.Block().Put(globalContext, reader)
+	stat, err := ipfsAPI.Block().Put(globalContext, reader)
 	if err != nil {
 		return "", err
 	}
@@ -180,100 +183,73 @@ func (h *pasteHandler) putPaste(p *paste) (string, error) {
 	return stat.Path().String(), nil
 }
 
-func (h *pasteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Get escaped path
-	rawPath := r.URL.EscapedPath()
+func helpHandler(writer http.ResponseWriter, _ *http.Request, _ httprouter.Params) {
+	writer.Header().Set("content-type", "text/plain")
+	writer.Write([]byte(rootHelpStr))
+}
 
-	// Ensure is absolute and within size bounds
-	if !path.IsAbs(rawPath) {
-		log.Printf("Illegal paste path requested: %s\n", rawPath)
-		http.Error(w, "Illegal paste path!", http.StatusNotAcceptable)
+func getPasteHandler(writer http.ResponseWriter, request *http.Request, params httprouter.Params) {
+	// Get paste path
+	pastePath := ipfsPrefix + params.ByName("cid")
+
+	// Try look for paste with CID
+	p, err := getPaste(pastePath)
+	if err != nil {
+		log.Printf("Paste not retrieved - %s\n", err.Error())
+		http.Error(writer, "Paste not found!", http.StatusNotFound)
 		return
 	}
 
-	// Log request
-	log.Printf("(%s) %s %s\n", r.RemoteAddr, r.Method, rawPath)
-
-	switch r.Method {
-	case "GET":
-		// At root send help string
-		if rawPath == "/" {
-			w.Write([]byte(rootHelpStr))
-			return
-		}
-
-		// Ensure has paste prefix then correct to IPFS path
-		if !strings.HasPrefix(rawPath, pastePrefix) {
-			log.Printf("Illegal paste path requested: %s\n", rawPath)
-			http.Error(w, "Illegal paste path!", http.StatusNotAcceptable)
-			return
-		}
-		rawPath = strings.Replace(rawPath, pastePrefix, ipfsPrefix, 1)
-
-		// Try look for paste with CID
-		p, err := h.getPaste(rawPath)
+	// If decryption key supplied, try decrypt
+	if key := request.URL.Query().Get("key"); key != "" {
+		err = p.decrypt(key)
 		if err != nil {
-			log.Printf("Paste not retrieved - %s\n", err.Error())
-			http.Error(w, "Paste not found!", http.StatusNotFound)
+			log.Printf("Failed to decrypt paste - %s\n", err.Error())
+			http.Error(writer, "Paste decryption failed!", http.StatusInternalServerError)
 			return
 		}
-
-		// If decryption key supplied, try decrypt
-		if key := r.URL.Query().Get("key"); key != "" {
-			err = p.decrypt(key)
-			if err != nil {
-				log.Printf("Failed to decrypt paste - %s\n", err.Error())
-				http.Error(w, "Paste decryption failed!", http.StatusInternalServerError)
-				return
-			}
-		}
-
-		// Write the paste!
-		w.Header().Set("content-type", "text/plain")
-		w.Write(p.text)
-
-	case "POST":
-		if rawPath != "/" {
-			log.Printf("Attempt to POST paste to non-root URL: %s\n", rawPath)
-			http.Error(w, "Pastes must be POSTed to root URL path!", http.StatusBadRequest)
-			return
-		}
-
-		// Set max read size to 1MB
-		r.Body = http.MaxBytesReader(w, r.Body, maxPasteSize)
-
-		// Read body content
-		b, err := ioutil.ReadAll(r.Body)
-		if err != nil {
-			log.Println("Failed to read request body")
-			http.Error(w, "Failed to read request", http.StatusInternalServerError)
-			return
-		}
-
-		// Create new paste, if encryption key provided, try encrypt!
-		p := &paste{b}
-		if key := r.URL.Query().Get("key"); key != "" {
-			err = p.encrypt(key)
-			if err != nil {
-				log.Printf("Failed to encrypt paste - %s\n", err.Error())
-				http.Error(w, "Paste encryption failed!", http.StatusInternalServerError)
-				return
-			}
-		}
-
-		// Place the paste into the IPFS store
-		pathStr, err := h.putPaste(p)
-		if err != nil {
-			log.Printf("Failed to put paste in store - %s\n", err.Error())
-			http.Error(w, "Failed to put paste in store", http.StatusInternalServerError)
-			return
-		}
-		pathStr = strings.Replace(pathStr, ipfsPrefix, pastePrefix, 1)
-
-		// Write the store path in response
-		w.Header().Set("content-type", "text/plain")
-		w.Write([]byte(pathStr))
 	}
+
+	// Write the paste!
+	writer.Header().Set("content-type", "text/plain")
+	writer.Write(p.text)
+}
+
+func putPasteHandler(writer http.ResponseWriter, request *http.Request, _ httprouter.Params) {
+	// Set max read size to 1MB
+	request.Body = http.MaxBytesReader(writer, request.Body, maxPasteSize)
+
+	// Read body content
+	b, err := ioutil.ReadAll(request.Body)
+	if err != nil {
+		log.Println("Failed to read request body")
+		http.Error(writer, "Failed to read request", http.StatusInternalServerError)
+		return
+	}
+
+	// Create new paste, if encryption key provided, try encrypt!
+	p := &paste{b}
+	if key := request.URL.Query().Get("key"); key != "" {
+		err = p.encrypt(key)
+		if err != nil {
+			log.Printf("Failed to encrypt paste - %s\n", err.Error())
+			http.Error(writer, "Paste encryption failed!", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	// Place the paste into the IPFS store
+	pathStr, err := putPaste(p)
+	if err != nil {
+		log.Printf("Failed to put paste in store - %s\n", err.Error())
+		http.Error(writer, "Failed to put paste in store", http.StatusInternalServerError)
+		return
+	}
+	pathStr = strings.Replace(pathStr, ipfsPrefix, pastePrefix, 1)
+
+	// Write the store path in response
+	writer.Header().Set("content-type", "text/plain")
+	writer.Write([]byte(pathStr))
 }
 
 func initIPFSRepo(repoPath string) error {
@@ -386,6 +362,10 @@ func init() {
 }
 
 func main() {
+	// Define error here
+	var err error
+
+	// Set flags and parse!
 	httpHostname := flag.String("http-hostname", "", "Set HTTP hostname for printed help message")
 	httpBindAddr := flag.String("http-bind-addr", "localhost", "Bind HTTP server to address")
 	httpPort := flag.Uint("http-port", 443, "Bind HTTP server to port")
@@ -414,7 +394,7 @@ func main() {
 		log.Printf("IPFS repo at %s does not exist!\n", *ipfsRepo)
 
 		// First load plugins
-		err := setupIPFSPlugins("")
+		err = setupIPFSPlugins("")
 		if err != nil {
 			fatalf(err.Error())
 		}
@@ -426,17 +406,23 @@ func main() {
 		}
 	} else {
 		// First load plugins
-		err := setupIPFSPlugins(*ipfsRepo)
+		err = setupIPFSPlugins(*ipfsRepo)
 		if err != nil {
 			fatalf(err.Error())
 		}
 	}
 
 	// Get new IPFS node API instance
-	coreAPI, err := constructIPFSNodeAPI(*ipfsRepo)
+	ipfsAPI, err = constructIPFSNodeAPI(*ipfsRepo)
 	if err != nil {
 		fatalf(err.Error())
 	}
+
+	// Set HTTP routing
+	router := httprouter.New()
+	router.GET("/", helpHandler)
+	router.POST("/", putPasteHandler)
+	router.GET(pastePrefix+":cid", getPasteHandler)
 
 	// Create new HTTP server object
 	httpAddr := *httpBindAddr + ":" + strconv.Itoa(int(*httpPort))
@@ -446,7 +432,7 @@ func main() {
 		WriteTimeout:      2 * time.Second,
 		IdleTimeout:       2 * time.Second,
 		ReadHeaderTimeout: 2 * time.Second,
-		Handler:           &pasteHandler{coreAPI},
+		Handler:           router,
 	}
 
 	// If hostname not set, use httpAddr
