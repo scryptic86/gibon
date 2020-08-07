@@ -418,8 +418,18 @@ func main() {
 		fatalf(err.Error())
 	}
 
-	// Set HTTP routing
-	router := httprouter.New()
+	// Setup HTTP router
+	router := &httprouter.Router{
+		RedirectTrailingSlash:  true,
+		RedirectFixedPath:      true,
+		HandleMethodNotAllowed: true,
+		HandleOPTIONS:          false,
+		PanicHandler: func(writer http.ResponseWriter, _ *http.Request, _ interface{}) {
+			http.Error(writer, "Unknown error occurred!", http.StatusServiceUnavailable)
+		},
+	}
+
+	// Add HTTP routes
 	router.GET("/", helpHandler)
 	router.POST("/", putPasteHandler)
 	router.GET(pastePrefix+":cid", getPasteHandler)
