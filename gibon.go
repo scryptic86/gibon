@@ -189,14 +189,24 @@ func putPaste(p *paste) (string, error) {
 	return stat.Path().String(), nil
 }
 
-func helpHandler(writer http.ResponseWriter, _ *http.Request, _ httprouter.Params) {
+func helpHandler(writer http.ResponseWriter, request *http.Request, _ httprouter.Params) {
+	// Log request
+	logRequest("GET", "/", request.RemoteAddr)
+
+	// Serve help page
 	writer.Header().Set("content-type", "text/plain")
 	writer.Write([]byte(rootHelpStr))
 }
 
 func getPasteHandler(writer http.ResponseWriter, request *http.Request, params httprouter.Params) {
+	// Get the CID string
+	cidStr := params.ByName("cid")
+
+	// Log the request
+	logRequest("GET", pastePrefix+cidStr, request.RemoteAddr)
+
 	// Get paste path
-	pastePath := ipfsPrefix + params.ByName("cid")
+	pastePath := ipfsPrefix + cidStr
 
 	// Try look for paste with CID
 	p, err := getPaste(pastePath)
@@ -222,6 +232,9 @@ func getPasteHandler(writer http.ResponseWriter, request *http.Request, params h
 }
 
 func putPasteHandler(writer http.ResponseWriter, request *http.Request, _ httprouter.Params) {
+	// Log the request
+	logRequest("POST", "/", request.RemoteAddr)
+
 	// Set max read size to 1MB
 	request.Body = http.MaxBytesReader(writer, request.Body, maxPasteSize)
 
@@ -346,6 +359,10 @@ func constructIPFSNodeAPI(repoPath string) (icore.CoreAPI, error) {
 	// Return core API wrapping the node
 	log.Println("Wrapping IPFS node in core API...")
 	return coreapi.NewCoreAPI(node)
+}
+
+func logRequest(reqMethod, reqPath, reqAddr string) {
+	log.Printf("SERVE %s (%s) %s\n", reqMethod, reqAddr, reqPath)
 }
 
 func fatalf(fmt string, args ...interface{}) {
