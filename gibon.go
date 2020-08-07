@@ -35,15 +35,13 @@ import (
 )
 
 const (
+	versionStr  = "v0.1.0-beta"
 	pastePrefix = "/paste/"
 	ipfsPrefix  = "/ipld/"
-
-	maxPasteSize = 1048576
-
-	unixfsGetTimeout = time.Millisecond * 250
 )
 
 var (
+	// Customizable (by hostname) help page string
 	rootHelpStr = `Gibon -- an IPFS-backed pastebin service with encryption support!
 
 Usage:
@@ -60,10 +58,18 @@ $ curl https://%s/paste/<PASTE_ID>?key=awful_password
 --> 'paste text goes here'
 `
 
+	// Store global context and cancel for global error exit function
 	globalContext context.Context
 	globalCancel  func()
 
+	// IPFS global core API object
 	ipfsAPI icore.CoreAPI
+
+	// IPFS Unixfs() API get timeout
+	unixfsGetTimeout time.Duration
+
+	// Maximum paste size (in bytes)
+	maxPasteSize int64
 )
 
 type paste struct {
@@ -372,6 +378,8 @@ func main() {
 	ipfsRepo := flag.String("ipfs-repo", "", "IPFS repo path")
 	certFile := flag.String("cert-file", "", "TLS certificate file")
 	keyFile := flag.String("key-file", "", "TLS key file")
+	pasteMax := flag.Float64("paste-size-max", 1.0, "Maximum paste size (in megabytes)")
+	flag.DurationVar(&unixfsGetTimeout, "ipfs-get-timeout", time.Millisecond*250, "IPFS unixfs API get timeout")
 	flag.Parse()
 
 	// Get current context (cancellable)
@@ -388,6 +396,12 @@ func main() {
 	} else if *keyFile == "" {
 		fatalf("No TLS key file supplied!")
 	}
+
+	// Ensure max paste size non-zero and set
+	if *pasteMax == 0.0 {
+		fatalf("Max paste size must be greater than zero!")
+	}
+	maxPasteSize = int64(*pasteMax * 1048576.0)
 
 	// Check if repo initialized
 	if !fsrepo.IsInitialized(*ipfsRepo) {
@@ -443,6 +457,7 @@ func main() {
 		IdleTimeout:       2 * time.Second,
 		ReadHeaderTimeout: 2 * time.Second,
 		Handler:           router,
+		ErrorLog:          log.New(ioutil.Discard, "", 0),
 	}
 
 	// If hostname not set, use httpAddr
